@@ -9,7 +9,9 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
+	"github.com/gabe-lee/Boot.Dev-Chirpy/internal/auth"
 	"github.com/gabe-lee/Boot.Dev-Chirpy/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -19,14 +21,31 @@ import (
 const PORT = "8080"
 
 var dbURL string
+var jwtSecret string
 
 type postChirpRequest struct {
-	Body   string `json:"body"`
-	UserID string `json:"user_id"`
+	Body string `json:"body"`
 }
 
-type newUserRequest struct {
+type userLoginRequest struct {
+	Pass  string `json:"password"`
 	Email string `json:"email"`
+}
+type userLoginResponse struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+	Token     string    `json:"token"`
+	Refresh   string    `json:"refresh_token"`
+}
+type newUserRequest struct {
+	Pass  string `json:"password"`
+	Email string `json:"email"`
+}
+
+type tokenRefreshResponse struct {
+	Token string `json:"token"`
 }
 
 var profanityWords = [...]string{
@@ -38,6 +57,7 @@ var profanityWords = [...]string{
 func init() {
 	godotenv.Load()
 	dbURL = os.Getenv("DB_URL")
+	jwtSecret = os.Getenv("JWT_SECRET")
 }
 
 func main() {
@@ -58,6 +78,9 @@ func main() {
 	mux.HandleFunc("GET /api/chirps", app.getAllChirps())
 	mux.HandleFunc("GET /api/chirps/{chirpID}", app.getChirp())
 	mux.HandleFunc("POST /api/users", app.addNewUser())
+	mux.HandleFunc("POST /api/login", app.loginUser())
+	mux.HandleFunc("POST /api/refresh", app.refreshToken())
+	mux.HandleFunc("POST /api/revoke", app.revokeToken())
 	fmt.Printf("Server listening on port %s...", PORT)
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
@@ -89,7 +112,7 @@ func writeJsonErrorIfErr(w http.ResponseWriter, err error, code int, msgFmt stri
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
-		fmt.Fprintf(w, "{\n    error: \"%s\"\n}", fmt.Sprintf(msgFmt, msgArgs...))
+		fmt.Fprintf(w, "{\n    \"error\": \"%s\"\n}", fmt.Sprintf(msgFmt, msgArgs...))
 		return true
 	}
 	return false
@@ -99,7 +122,17 @@ func writeJsonErrorIfTrue(w http.ResponseWriter, cond bool, code int, msgFmt str
 	if cond {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
-		fmt.Fprintf(w, "{\n    error: \"%s\"\n}", fmt.Sprintf(msgFmt, msgArgs...))
+		fmt.Fprintf(w, "{\n    \"error\": \"%s\"\n}", fmt.Sprintf(msgFmt, msgArgs...))
+		return true
+	}
+	return false
+}
+
+func writeJsonErrorIfErrOrTrue(w http.ResponseWriter, err error, cond bool, code int, msgFmt string, msgArgs ...any) bool {
+	if err != nil || cond {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		fmt.Fprintf(w, "{\n    \"error\": \"%s\"\n}", fmt.Sprintf(msgFmt, msgArgs...))
 		return true
 	}
 	return false
@@ -147,23 +180,30 @@ func (state *appState) getChirp() func(w http.ResponseWriter, req *http.Request)
 
 func (state *appState) postChirp() func(w http.ResponseWriter, req *http.Request) {
 	return func(w http.ResponseWriter, req *http.Request) {
+		token, err := auth.GetBearerToken(req.Header)
+		if writeJsonErrorIfErr(w, err, 401, "Not logged in, cannot post Chirp") {
+			return
+		}
+		tokenId, err := auth.ValidateJWT(token, jwtSecret)
+		if writeJsonErrorIfErr(w, err, 401, "Token expired, please login again") {
+			return
+		}
 		decoder := json.NewDecoder(req.Body)
 		body := postChirpRequest{}
-		err := decoder.Decode(&body)
+		err = decoder.Decode(&body)
 		if writeJsonErrorIfErr(w, err, 500, "Error decoding json: %s", err) {
 			return
 		}
-		if writeJsonErrorIfTrue(w, len(body.Body) > 140, 400, "Chirp is too long, max = 140, recieved = %d", len(body.Body)) {
+		if writeJsonErrorIfTrue(w, len(body.Body) > 140, 400, "Chirp is too long, max = 140 chars, recieved = %d chars", len(body.Body)) {
 			return
 		}
 		cleanBody := replaceProfanity(body.Body)
-		userId, err := uuid.Parse(body.UserID)
-		if writeJsonErrorIfErr(w, err, 400, "Invalid user_id UUID `%s` for Chirp: %s", body.UserID, err) {
+		if writeJsonErrorIfErr(w, err, 400, "Invalid user_id UUID `%s` for Chirp: %s", tokenId, err) {
 			return
 		}
 		chirp, err := state.db.PostChirp(req.Context(), database.PostChirpParams{
 			Body:   cleanBody,
-			UserID: userId,
+			UserID: tokenId,
 		})
 		if writeJsonErrorIfErr(w, err, 500, "Unable to post chirp: %s", err) {
 			return
@@ -234,10 +274,99 @@ func (state *appState) addNewUser() func(w http.ResponseWriter, req *http.Reques
 		if writeJsonErrorIfErr(w, err, 500, "Error decoding json: %s", err) {
 			return
 		}
-		user, err := state.db.CreateUser(req.Context(), body.Email)
+		pass, err := auth.HashPassword(body.Pass)
+		if writeJsonErrorIfErr(w, err, 500, "Error hashing password: %s", err) {
+			return
+		}
+		user, err := state.db.CreateUser(req.Context(), database.CreateUserParams{
+			Email:          body.Email,
+			HashedPassword: pass,
+		})
 		if writeJsonErrorIfErr(w, err, 500, "Error adding new user: %s", err) {
 			return
 		}
 		writeJson(w, 201, user)
+	}
+}
+
+func (state *appState) loginUser() func(w http.ResponseWriter, req *http.Request) {
+	return func(w http.ResponseWriter, req *http.Request) {
+		decoder := json.NewDecoder(req.Body)
+		body := userLoginRequest{}
+		err := decoder.Decode(&body)
+		if writeJsonErrorIfErr(w, err, 500, "Error decoding json: %s", err) {
+			return
+		}
+		user, err := state.db.FindUserByEmail(req.Context(), body.Email)
+		if writeJsonErrorIfErr(w, err, 401, "Incorrect email or password") {
+			return
+		}
+		err = auth.CheckPasswordHash(body.Pass, user.HashedPassword)
+		if writeJsonErrorIfErr(w, err, 401, "Incorrect email or password") {
+			return
+		}
+		token, err := auth.MakeJWT(user.ID, jwtSecret, time.Hour)
+		if writeJsonErrorIfErr(w, err, 500, "Failed to create JWT token: %s", err) {
+			return
+		}
+		refresh, _ := auth.MakeRefreshToken()
+		err = state.db.NewRefresh(req.Context(), database.NewRefreshParams{
+			Token:     refresh,
+			UserID:    user.ID,
+			ExpiresAt: time.Now().Add(time.Hour * 24 * 60),
+		})
+		if writeJsonErrorIfErr(w, err, 500, "Failed to create Refresh token: %s", err) {
+			return
+		}
+		userNoPass := userLoginResponse{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email,
+			Token:     token,
+			Refresh:   refresh,
+		}
+		writeJson(w, 200, userNoPass)
+	}
+}
+
+func (state *appState) refreshToken() func(w http.ResponseWriter, req *http.Request) {
+	return func(w http.ResponseWriter, req *http.Request) {
+		refresh, err := auth.GetBearerToken(req.Header)
+		if writeJsonErrorIfErr(w, err, 400, "Failed to parse refresh token: %s", err) {
+			return
+		}
+		revoked, err := state.db.CheckRevoke(req.Context(), refresh)
+		if writeJsonErrorIfErrOrTrue(w, err, revoked.Valid, 401, "No Refresh token, please login first") {
+			return
+		}
+		id, err := state.db.UpdateRefresh(req.Context(), database.UpdateRefreshParams{
+			Token:     refresh,
+			ExpiresAt: time.Now().Add(time.Hour * 24 * 60),
+		})
+		if writeJsonErrorIfErr(w, err, 500, "Failed to update Refresh token: %s", err) {
+			return
+		}
+		token, err := auth.MakeJWT(id, jwtSecret, time.Hour)
+		if writeJsonErrorIfErr(w, err, 500, "Failed to create JWT token: %s", err) {
+			return
+		}
+		writeJson(w, 200, tokenRefreshResponse{
+			Token: token,
+		})
+	}
+}
+
+func (state *appState) revokeToken() func(w http.ResponseWriter, req *http.Request) {
+	return func(w http.ResponseWriter, req *http.Request) {
+		refresh, err := auth.GetBearerToken(req.Header)
+		if writeJsonErrorIfErr(w, err, 400, "Failed to parse refresh token: %s", err) {
+			return
+		}
+		err = state.db.RevokeRefresh(req.Context(), refresh)
+		if writeJsonErrorIfErr(w, err, 500, "failed to revoke Refresh token: %s", err) {
+			return
+		}
+		w.WriteHeader(204)
 	}
 }
