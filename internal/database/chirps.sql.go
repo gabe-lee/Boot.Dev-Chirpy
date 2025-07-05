@@ -11,6 +11,15 @@ import (
 	"github.com/google/uuid"
 )
 
+const deleteChirp = `-- name: DeleteChirp :exec
+DELETE FROM chirps WHERE id=$1
+`
+
+func (q *Queries) DeleteChirp(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.ExecContext(ctx, deleteChirp, id)
+	return err
+}
+
 const getAllChirps = `-- name: GetAllChirps :many
 SELECT id, created_at, updated_at, body, user_id FROM chirps ORDER BY created_at
 `
@@ -59,6 +68,17 @@ func (q *Queries) GetChirp(ctx context.Context, id uuid.UUID) (Chirp, error) {
 		&i.UserID,
 	)
 	return i, err
+}
+
+const getChirpAuthor = `-- name: GetChirpAuthor :one
+SELECT user_id FROM chirps WHERE id=$1
+`
+
+func (q *Queries) GetChirpAuthor(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRowContext(ctx, getChirpAuthor, id)
+	var user_id uuid.UUID
+	err := row.Scan(&user_id)
+	return user_id, err
 }
 
 const postChirp = `-- name: PostChirp :one

@@ -77,7 +77,9 @@ func main() {
 	mux.HandleFunc("POST /api/chirps", app.postChirp())
 	mux.HandleFunc("GET /api/chirps", app.getAllChirps())
 	mux.HandleFunc("GET /api/chirps/{chirpID}", app.getChirp())
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", app.deleteChirp())
 	mux.HandleFunc("POST /api/users", app.addNewUser())
+	mux.HandleFunc("PUT /api/users", app.updateUser())
 	mux.HandleFunc("POST /api/login", app.loginUser())
 	mux.HandleFunc("POST /api/refresh", app.refreshToken())
 	mux.HandleFunc("POST /api/revoke", app.revokeToken())
@@ -365,6 +367,68 @@ func (state *appState) revokeToken() func(w http.ResponseWriter, req *http.Reque
 		}
 		err = state.db.RevokeRefresh(req.Context(), refresh)
 		if writeJsonErrorIfErr(w, err, 500, "failed to revoke Refresh token: %s", err) {
+			return
+		}
+		w.WriteHeader(204)
+	}
+}
+
+func (state *appState) updateUser() func(w http.ResponseWriter, req *http.Request) {
+	return func(w http.ResponseWriter, req *http.Request) {
+		accessHeader, err := auth.GetBearerToken(req.Header)
+		if writeJsonErrorIfErr(w, err, 401, "Failed to get access token from header: %s", err) {
+			return
+		}
+		id, err := auth.ValidateJWT(accessHeader, jwtSecret)
+		if writeJsonErrorIfErr(w, err, 401, "Failed to validate access token: %s", err) {
+			return
+		}
+		decoder := json.NewDecoder(req.Body)
+		newLogin := userLoginRequest{}
+		err = decoder.Decode(&newLogin)
+		if writeJsonErrorIfErr(w, err, 500, "Error decoding json: %s", err) {
+			return
+		}
+		newPassHash, err := auth.HashPassword(newLogin.Pass)
+		if writeJsonErrorIfErr(w, err, 500, "Error hashing password: %s", err) {
+			return
+		}
+		user, err := state.db.UpdateLogin(req.Context(), database.UpdateLoginParams{
+			ID:             id,
+			Email:          newLogin.Email,
+			HashedPassword: newPassHash,
+		})
+		if writeJsonErrorIfErr(w, err, 404, "user does not exist") {
+			return
+		}
+		writeJson(w, 200, user)
+	}
+}
+
+func (state *appState) deleteChirp() func(w http.ResponseWriter, req *http.Request) {
+	return func(w http.ResponseWriter, req *http.Request) {
+		accessHeader, err := auth.GetBearerToken(req.Header)
+		if writeJsonErrorIfErr(w, err, 401, "Failed to get access token from header: %s", err) {
+			return
+		}
+		userId, err := auth.ValidateJWT(accessHeader, jwtSecret)
+		if writeJsonErrorIfErr(w, err, 401, "Failed to validate access token: %s", err) {
+			return
+		}
+		chirpIdStr := req.PathValue("chirpID")
+		chirpId, err := uuid.Parse(chirpIdStr)
+		if writeJsonErrorIfErr(w, err, 401, "Invalid chirp id `%s`", chirpIdStr) {
+			return
+		}
+		author, err := state.db.GetChirpAuthor(req.Context(), chirpId)
+		if writeJsonErrorIfErr(w, err, 404, "Chirp was not found using id `%s`", chirpIdStr) {
+			return
+		}
+		if writeJsonErrorIfTrue(w, userId != author, 403, "You are not the author of this Chirp") {
+			return
+		}
+		err = state.db.DeleteChirp(req.Context(), chirpId)
+		if writeJsonErrorIfErr(w, err, 500, "failed to delete chirp: %s", err) {
 			return
 		}
 		w.WriteHeader(204)
